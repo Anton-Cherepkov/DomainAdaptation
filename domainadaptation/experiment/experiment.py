@@ -91,6 +91,9 @@ class DANNExperiment(Experiment):
     def experiment_no_domain_adaptation(self):
         backbone = self._get_new_backbone_instance()
         
+        for i in range(len(backbone.layers)):
+            backbone.layers[i].trainable = False
+        
         classifier_head = self._get_classifier_head(num_classes=self.config["dataset"]["classes"])
         
         classification_model = keras.Model(
@@ -113,14 +116,105 @@ class DANNExperiment(Experiment):
                 compute_loss=self._cross_entropy,
                 optimizer=optimizer,
                 train_generator=source_generator,
-                steps=self.config["steps"])
+                steps=self.config["steps"],
+                callbacks=[lambda **kwargs: print(tf.reduce_mean(kwargs['loss']))]
+            )
             print('epoch {} finished'.format(i + 1))
         
         
         tester = Tester()
         tester.test(classification_model, source_generator)
-
+        
+        target_generator = self.domain_generator.make_generator(
+            domain=self.config["dataset"]["target"],
+            batch_size=self.config["batch_size"],
+            target_size=self.config["backbone"]["img-size"]
+        )
+        target_tester = Tester()
+        target_tester.test(classification_model, target_generator)
+        
+    def experiment_domain_adaptation(self):
+        backbone = self._get_new_backbone_instance()
+        
+        for i in range(len(backbone.layers) - 5):
+            backbone.layers[i].trainable = False
+        
+        classifier_head = keras.Model(
+            inputs=backbone.inputs,
+            outputs=self._get_classifier_head(num_classes=self.config["dataset"]["classes"])(backbone.outputs[0])
+        )
+        
+        lambda_coef = tf.Variable(self._get_lambda(0.), trainable=False, dtype=tf.float32)
+        domain_head = keras.Model(
+            inputs=backbone.inputs,
+            outputs=self._get_classifier_head(num_classes=2)(GradientReversal(lambda_coef)(backbone.outputs[0]))
+        )
+        
+        
+        source_generator = self.domain_generator.make_generator(
+            domain=self.config["dataset"]["source"],
+            batch_size=self.config["batch_size"],
+            target_size=self.config["backbone"]["img-size"]
+        )
+        
+        target_generator = self.domain_generator.make_generator(
+            domain=self.config["dataset"]["target"],
+            batch_size=self.config["batch_size"],
+            target_size=self.config["backbone"]["img-size"]
+        )
+        
+        source_domain_generator = self._domain_wrapper(source_generator, domain=0)
+        target_domain_generator = self._domain_wrapper(target_generator, domain=1)
+        
+        trainer = Trainer()
+        classifier_head_optimizer = keras.optimizers.Adam(1e-4)
+        domain_head_optimizer = keras.optimizers.Adam(1e-4)
+        
+        for i in range(self.config["epochs"]):
+            lambda_coef.assign(self._get_lambda(i / self.config["epochs"]))
+            
+            trainer.train(
+                model=classifier_head,
+                compute_loss=self._cross_entropy,
+                optimizer=classifier_head_optimizer,
+                train_generator=source_generator,
+                steps=len(source_generator),
+                callbacks=[lambda **kwargs: print(tf.reduce_mean(kwargs['loss']))]
+            )
+            print('Classification epoch {} finished\n'.format(i + 1))
+            
+            for j in range(2 * min(len(source_generator), len(target_generator))):
+                generator = source_domain_generator if j % 2 == 0 else target_domain_generator
+                trainer.train(
+                    model=domain_head,
+                    compute_loss=self._cross_entropy,
+                    optimizer=domain_head_optimizer,
+                    train_generator=generator,
+                    steps=1,
+                    callbacks=[lambda **kwargs: print(tf.reduce_mean(kwargs['loss']))]
+                )
+                
+            if len(source_generator) > len(target_generator):
+                generator = source_domain_generator
+            else:
+                generator = target_domain_generator
+            
+            trainer.train(
+                model=domain_head,
+                compute_loss=self._cross_entropy,
+                optimizer=domain_head_optimizer,
+                train_generator=generator,
+                steps=max(len(source_generator), len(target_generator))\
+                    - min(len(source_generator), len(target_generator)),
+                callbacks=[lambda **kwargs: print(tf.reduce_mean(kwargs['loss']))]
+            )
+            print('Domain classification epoch {} finished\n'.format(i + 1))
+            
+            tester = Tester()
+            tester.test(classifier_head, source_generator)
+            tester.test(classifier_head, target_generator)
+        
     @staticmethod
-    def _get_lambda(p=0):
+    def _get_lambda(p=0.):
         """ Original lambda scheduler """
         return 2 / (1 + np.exp(-10 * p)) - 1
