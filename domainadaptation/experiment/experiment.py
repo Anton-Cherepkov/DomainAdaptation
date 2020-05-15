@@ -1,14 +1,17 @@
 from enum import Enum
+import sys
 
+from domainadaptation.models.alexnet import AlexNet
 import numpy as np
 import tensorflow as tf
 import tensorflow.keras as keras
 
-from ..tester import Tester
-from ..trainer import Trainer
-from ..visualizer import Visualizer
-from ..data_provider import DomainGenerator
-from ..models import Alexnet, Vgg16, Resnet50, Resnet101, GradientReversal
+from domainadaptation.trainer import Trainer
+from domainadaptation.visualizer import Visualizer
+from domainadaptation.data_provider import DomainGenerator
+
+import domainadaptation.models.alexnet
+from domainadaptation.models import AlexNet
 
 
 class Experiment:
@@ -17,6 +20,8 @@ class Experiment:
         VGG16 = "vgg16"
         RESNET50 = "resnet50"
         RESNET101 = "resnet101"
+        MOBILENET = "mobilenet"
+        MOBILENETv2 = "mobilenetv2"
 
         def __str__(self):
             return self.value
@@ -24,24 +29,71 @@ class Experiment:
     def __init__(self, config):
         self.config = config
 
+        self._kwargs_for_backbone = {
+            'include_top': False,
+            'weights': config['backbone']['weights'],
+            'input_shape': (*config['backbone']['img_size'], 3),
+            'pooling': config['backbone']['pooling'],
+        }
+
         if config["backbone"]["type"] == self.BackboneType.ALEXNET:
-            self.backbone = Alexnet().get_model()
+            self._backbone_class = AlexNet
+            self._preprocess_input = domainadaptation.models.alexnet.proprocess_input
         elif config["backbone"]["type"] == self.BackboneType.VGG16:
-            self.backbone = Vgg16().get_model()
+            self._backbone_class = keras.applications.vgg16.VGG16
+            self._preprocess_input = keras.applications.vgg16.preprocess_input
         elif config["backbone"]["type"] == self.BackboneType.RESNET50:
-            self.backbone = Resnet50().get_model()
+            self._backbone_class = keras.applications.resnet.ResNet50
+            self._preprocess_input = keras.applications.resnet.preprocess_input
         elif config["backbone"]["type"] == self.BackboneType.RESNET101:
-            self.backbone = Resnet101().get_model()
+            self._backbone_class = keras.applications.resnet.ResNet101
+            self._preprocess_input = keras.applications.resnet.preprocess_input
+        elif config["backbone"]["type"] == self.BackboneType.MOBILENET:
+            self._backbone_class = keras.applications.mobilenet.MobileNet
+            self._preprocess_input = keras.applications.mobilenet.preprocess_input
+        elif config["backbone"]["type"] == self.BackboneType.MOBILENETv2:
+            self._backbone_class = keras.applications.mobilenet_v2.MobileNetV2
+            self._preprocess_input = keras.applications.mobilenet_v2.preprocess_input
         else:
             raise ValueError("Not supported backbone type")
 
         self.domain_generator = DomainGenerator(config["dataset"]["path"],
+                                                preprocessing_function=self._preprocess_input,
                                                 **config["dataset"]["augmentations"])
 
+    def _get_new_backbone_instance(self, **kwargs):
+        if kwargs:
+            new_kwargs = self._kwargs_for_backbone.copy()
+            new_kwargs.update(kwargs)
+            instance = self._backbone_class(**new_kwargs)
+        else:
+            instance = self._backbone_class(**self._kwargs_for_backbone)
+
+        assert self.config['backbone']['num_trainable_layers'] >= -1
+        assert type(self.config['backbone']['num_trainable_layers']) == int
+
+        if self.config['backbone']['num_trainable_layers'] != -1:
+            num_non_trainable_layers = len(instance.layers) - self.config['backbone']['num_trainable_layers']
+            for layer in instance.layers[:num_non_trainable_layers]:
+                layer.trainable = False
+        
+        if 'freeze_all_batchnorms' in self.config['backbone'] and self.config['backbone']['freeze_all_batchnorms'] == True:
+            frozen_bn_cnt = 0
+            for layer in instance.layers:
+                if 'BatchNormalization' in str(type(layer)):
+                    frozen_bn_cnt += 1
+                    layer.trainable = False
+            sys.stderr.write('{} batchnorm layers from backbone are frozen.\n'.format(frozen_bn_cnt))
+
+        return instance
+
     @staticmethod
-    def _cross_entropy(model, x_batch, y_batch):
-        logits = model(x_batch)
-        return tf.nn.softmax_cross_entropy_with_logits(y_batch, logits)
+    def _cross_entropy(model, x_batch, y_batch, head):
+
+        assert head in [0, 1], "wrong head number"
+
+        logits = model(x_batch)[head]
+        return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(y_batch, logits))
 
     @staticmethod
     def _domain_wrapper(generator, domain=0):
@@ -56,73 +108,9 @@ class Experiment:
 
     @staticmethod
     def _get_classifier_head(num_classes):
-        return keras.layers.Dense(units=num_classes)
 
-
-class DANNExperiment(Experiment):
-    """
-    Domain-Adversarial Training of Neural Networks
-    link: https://arxiv.org/abs/1505.07818
-    """
-
-    def __init__(self, config):
-        super().__init__(config)
-
-        # -- create model --
-        classifier_head = self._get_classifier_head(num_classes=config["dataset"]["classes"])
-        domain_head = self._get_classifier_head(num_classes=2)
-        gradient_reversal_layer = GradientReversal(self._get_lambda())
-
-        self.model = keras.Model(
-            inputs=self.backbone.inputs,
-            outputs=[
-                classifier_head(self.backbone.outputs),
-                domain_head(gradient_reversal_layer(self.backbone.outputs))
-            ]
-        )
-
-    def __call__(self):
-
-        # -- initialization --
-        optimizer = keras.optimizers.Adam()
-        source_generator = self.domain_generator.make_generator(
-            domain=self.config["dataset"]["source"],
-            batch_size=self.config["batch_size"],
-            target_size=self.config["backbone"]["img-size"]
-        )
-        target_generator = self.domain_generator.make_generator(
-            domain=self.config["dataset"]["target"],
-            batch_size=self.config['batch_size'],
-            target_size=self.config["backbone"]["img-size"]
-        )
-
-        # -- training strategy --
-        trainer = Trainer()
-        for _ in range(self.config["epochs"]):
-            # TODO add callbacks
-
-            for generator in [source_generator,
-                              self._domain_wrapper(source_generator, domain=0),
-                              self._domain_wrapper(target_generator, domain=1)]:
-                trainer.train(
-                    model=self.model,
-                    compute_loss=self._cross_entropy,
-                    optimizer=optimizer,  # the same optimizer ?
-                    train_generator=generator,
-                    steps=self.config["steps"]
-                )
-
-                # TODO somehow increase lambda in grad_rev_layer
-
-        # -- evaluation --
-        tester = Tester()
-        tester.test(self.model, target_generator)
-
-        # -- visualization --
-        # visualizer = Visualizer(embeddings=X, domains=domains, labels=y)
-        # visualizer.visualize(size=75)
-
-    @staticmethod
-    def _get_lambda(p=0):
-        """ Original lambda scheduler """
-        return 2 / (1 + np.exp(-10 * p)) - 1
+        return keras.models.Sequential([
+            keras.layers.Dense(units=1024, activation='relu'),
+            keras.layers.Dense(units=1024, activation='relu'),
+            keras.layers.Dense(units=num_classes)
+        ])
